@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field, field_validator
 import logging
 import PyPDF2
 from io import BytesIO
+from pydantic import BaseModel
+from typing import List
 
 # Configure logging
 logging.basicConfig(
@@ -49,6 +51,27 @@ class ProcurementStatus(str, Enum):
     EXCESS_PROCUREMENT = "Excess Procurement"
     MIXED = "Mixed (Some Excess, Some Short)"
 
+
+class InventoryAnalysisResult(BaseModel):
+    stock_code: str
+    description: str
+    quantity: int
+    rate: float
+    total_amount: float
+    carrying_cost: float
+    gross_margin: float
+    alert: bool  # True if gross margin < carrying cost
+
+class InvoiceRegisterRequest(BaseModel):
+    invoice_text: str  # Raw text from PDF
+
+class InvoiceRegisterResponse(BaseModel):
+    total_items: int
+    total_invoice_amount: float
+    total_carrying_cost: float
+    total_gross_margin: float
+    analysis: List[InventoryAnalysisResult]
+    
 # --- Pydantic Models ---
 
 class LineItem(BaseModel):
@@ -936,6 +959,76 @@ async def verify_procurement_text(request: ProcurementTextRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred: {str(e)}"
         )
+    
+
+
+@app.post("/invoice-register-text/", response_model=InvoiceRegisterResponse)
+async def invoice_register_text(request: InvoiceRegisterRequest):
+    """
+    Parses invoice text, computes carrying costs and gross margins,
+    and highlights items where Gross Margin < Carrying Cost.
+    """
+    try:
+        invoice_text = request.invoice_text
+        if not invoice_text.strip():
+            raise HTTPException(status_code=422, detail="Invoice text cannot be empty")
+
+        # Parse line items
+        items = DocumentParser._extract_line_items(invoice_text)
+        if not items:
+            raise HTTPException(status_code=422, detail="No line items found in invoice")
+
+        analysis_results = []
+        total_invoice_amount = Decimal("0.00")
+        total_carrying_cost = Decimal("0.00")
+        total_gross_margin = Decimal("0.00")
+
+        for item in items:
+            # Example: carrying cost = 10% of rate per unit
+            carrying_cost_per_unit = item.rate * Decimal("0.1")
+            carrying_cost_total = carrying_cost_per_unit * item.quantity
+
+            # Example: cost price = 80% of rate
+            cost_price = item.rate * Decimal("0.8")
+            gross_margin_total = (item.rate - cost_price) * item.quantity
+
+            alert = gross_margin_total < carrying_cost_total
+
+            analysis_results.append(InventoryAnalysisResult(
+                stock_code=item.stock_code,
+                description=item.description,
+                quantity=item.quantity,
+                rate=float(item.rate),
+                total_amount=float(item.amount),
+                carrying_cost=float(carrying_cost_total),
+                gross_margin=float(gross_margin_total),
+                alert=alert
+            ))
+
+            total_invoice_amount += item.amount
+            total_carrying_cost += carrying_cost_total
+            total_gross_margin += gross_margin_total
+
+        return InvoiceRegisterResponse(
+            total_items=len(items),
+            total_invoice_amount=float(total_invoice_amount),
+            total_carrying_cost=float(total_carrying_cost),
+            total_gross_margin=float(total_gross_margin),
+            analysis=analysis_results
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Invoice register analysis failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
