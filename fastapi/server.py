@@ -1,14 +1,16 @@
 import os
 import re
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from decimal import Decimal
 from enum import Enum
 from dotenv import load_dotenv
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 import logging
+import PyPDF2
+from io import BytesIO
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +43,12 @@ class DiscrepancyType(str, Enum):
     ITEM_MISSING = "Item Missing"
     TOTAL_MISMATCH = "Total Mismatch"
 
+class ProcurementStatus(str, Enum):
+    EXACT_MATCH = "Exact Match"
+    SHORT_PROCUREMENT = "Short Procurement"
+    EXCESS_PROCUREMENT = "Excess Procurement"
+    MIXED = "Mixed (Some Excess, Some Short)"
+
 # --- Pydantic Models ---
 
 class LineItem(BaseModel):
@@ -51,7 +59,7 @@ class LineItem(BaseModel):
     rate: Decimal = Field(..., gt=0)
     amount: Decimal = Field(..., gt=0)
 
-    @validator('rate', 'amount', pre=True)
+    @field_validator('rate', 'amount')
     def convert_to_decimal(cls, v):
         """Convert float/string to Decimal for precise calculations."""
         if isinstance(v, str):
@@ -69,7 +77,7 @@ class ParsedDocument(BaseModel):
     items: List[LineItem] = Field(..., min_items=1)
     total_amount: Decimal
 
-    @validator('total_amount', pre=True)
+    @field_validator("total_amount")
     def convert_total_to_decimal(cls, v):
         if isinstance(v, str):
             v = v.replace(',', '')
@@ -91,7 +99,7 @@ class MatchDiscrepancy(BaseModel):
     item_description: str
     discrepancy_type: DiscrepancyType
     issue: str
-    details: Optional[Dict[str, any]] = None
+    details: Optional[Dict[str, Any]] = None
 
 class MatchResult(BaseModel):
     """Final output structure."""
@@ -104,10 +112,43 @@ class MatchResult(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
+# --- NEW MODELS FOR 2-WAY VERIFICATION ---
+
+class ProcurementDiscrepancy(BaseModel):
+    """Describes procurement quantity/amount discrepancies."""
+    item_description: str
+    stock_code: Optional[str]
+    po_quantity: int
+    invoice_quantity: int
+    variance: int  # Positive = excess, Negative = short
+    variance_percentage: float
+    po_amount: float
+    invoice_amount: float
+    amount_variance: float
+
+class ProcurementTextRequest(BaseModel):
+    purchase_order_text: str
+    purchase_invoice_text: str
+
+class TwoWayVerificationResult(BaseModel):
+    """Result of 2-way PO vs Invoice verification."""
+    verification_status: str
+    procurement_status: ProcurementStatus
+    po_number: str
+    total_items_checked: int
+    items_with_discrepancies: int
+    quantity_discrepancies: List[ProcurementDiscrepancy]
+    rate_discrepancies: List[ProcurementDiscrepancy]
+    missing_items: List[str]
+    excess_items: List[str]
+    financial_summary: dict
+    ai_summary: str
+    recommendations: List[str]
+
 # --- FastAPI Application ---
 app = FastAPI(
-    title="3-Way Match API",
-    description="Processes text from PO, GRN, and Invoice documents to verify consistency.",
+    title="Procurement Verification API",
+    description="Processes PO, GRN, and Invoice documents for 3-way and 2-way verification.",
     version="2.0.0"
 )
 
@@ -119,6 +160,54 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- PDF Parser ---
+
+class PDFParser:
+    """Handles PDF file parsing to extract text."""
+    
+    @staticmethod
+    async def extract_text_from_pdf(file: UploadFile) -> str:
+        """
+        Extract text from uploaded PDF file.
+        
+        Args:
+            file: UploadFile object from FastAPI
+            
+        Returns:
+            Extracted text as string
+            
+        Raises:
+            HTTPException: If PDF parsing fails
+        """
+        try:
+            # Read file content
+            content = await file.read()
+            pdf_file = BytesIO(content)
+            
+            # Parse PDF
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            
+            if len(pdf_reader.pages) == 0:
+                raise ValueError("PDF file is empty")
+            
+            # Extract text from all pages
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            
+            if not text.strip():
+                raise ValueError("No text could be extracted from PDF")
+            
+            logger.info(f"Successfully extracted {len(text)} characters from PDF")
+            return text
+            
+        except Exception as e:
+            logger.error(f"Failed to parse PDF: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Failed to parse PDF file: {str(e)}"
+            )
 
 # --- Document Parser ---
 
@@ -132,9 +221,10 @@ class DocumentParser:
     ]
     
     ITEM_PATTERN = re.compile(
-        r"(.+?)\s+by\s+.+?\s+Stock Code:\s*(\S+)\s+(\d+)\s+₹?([\d,]+\.\d{2})\s+([\d,]+\.\d{2})",
-        re.IGNORECASE
-    )
+    r"\d*\.\s*(.+?)\s+by\s+.+?\s+Stock Code:\s*(\S+)\s+(\d+)\s+₹?([\d,]+\.\d{2})\s+₹?([\d,]+\.\d{2})",
+    re.IGNORECASE
+)
+
     
     TOTAL_PATTERN = re.compile(r"TOTAL\s+₹?([\d,]+\.\d{2})", re.IGNORECASE)
     
@@ -314,6 +404,191 @@ class ThreeWayMatcher:
         
         return discrepancies
 
+# --- NEW: Two-Way Verification Logic ---
+
+class TwoWayVerifier:
+    """Performs 2-way verification between PO and Invoice."""
+    
+    @staticmethod
+    def verify(po: ParsedDocument, invoice: ParsedDocument) -> TwoWayVerificationResult:
+        """
+        Verifies PO against Invoice and identifies procurement discrepancies.
+        
+        Args:
+            po: Parsed Purchase Order
+            invoice: Parsed Purchase Invoice
+            
+        Returns:
+            TwoWayVerificationResult with detailed analysis
+        """
+        # Validate PO numbers match
+        if po.po_number != invoice.po_number:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"PO Number Mismatch: PO='{po.po_number}', Invoice='{invoice.po_number}'"
+            )
+        
+        # Create lookup dictionaries
+        po_items = {item.stock_code: item for item in po.items}
+        invoice_items = {item.stock_code: item for item in invoice.items}
+        
+        # Initialize result lists
+        quantity_discrepancies = []
+        rate_discrepancies = []
+        missing_items = []
+        excess_items = []
+        
+        # Track overall procurement status
+        has_excess = False
+        has_short = False
+        
+        # Check items in PO
+        for code, po_item in po_items.items():
+            if code not in invoice_items:
+                missing_items.append(f"{po_item.description} (Code: {code})")
+                has_short = True
+                continue
+            
+            invoice_item = invoice_items[code]
+            
+            # Check quantity variance
+            variance = invoice_item.quantity - po_item.quantity
+            if variance != 0:
+                variance_pct = (variance / po_item.quantity) * 100
+                
+                if variance > 0:
+                    has_excess = True
+                else:
+                    has_short = True
+                
+                quantity_discrepancies.append(ProcurementDiscrepancy(
+                    item_description=po_item.description,
+                    stock_code=code,
+                    po_quantity=po_item.quantity,
+                    invoice_quantity=invoice_item.quantity,
+                    variance=variance,
+                    variance_percentage=round(variance_pct, 2),
+                    po_amount=float(po_item.amount),
+                    invoice_amount=float(invoice_item.amount),
+                    amount_variance=float(invoice_item.amount - po_item.amount)
+                ))
+            
+            # Check rate variance
+            if abs(po_item.rate - invoice_item.rate) > TOLERANCE:
+                rate_discrepancies.append(ProcurementDiscrepancy(
+                    item_description=po_item.description,
+                    stock_code=code,
+                    po_quantity=po_item.quantity,
+                    invoice_quantity=invoice_item.quantity,
+                    variance=0,
+                    variance_percentage=0.0,
+                    po_amount=float(po_item.rate),
+                    invoice_amount=float(invoice_item.rate),
+                    amount_variance=float(invoice_item.rate - po_item.rate)
+                ))
+        
+        # Check for excess items in invoice not in PO
+        for code, invoice_item in invoice_items.items():
+            if code not in po_items:
+                excess_items.append(f"{invoice_item.description} (Code: {code})")
+                has_excess = True
+        
+        # Determine procurement status
+        if has_excess and has_short:
+            procurement_status = ProcurementStatus.MIXED
+        elif has_excess:
+            procurement_status = ProcurementStatus.EXCESS_PROCUREMENT
+        elif has_short:
+            procurement_status = ProcurementStatus.SHORT_PROCUREMENT
+        else:
+            procurement_status = ProcurementStatus.EXACT_MATCH
+        
+        # Calculate financial summary
+        total_po_amount = float(po.total_amount)
+        total_invoice_amount = float(invoice.total_amount)
+        amount_variance = total_invoice_amount - total_po_amount
+        variance_percentage = (amount_variance / total_po_amount * 100) if total_po_amount > 0 else 0
+        
+        financial_summary = {
+            "po_total": total_po_amount,
+            "invoice_total": total_invoice_amount,
+            "amount_variance": amount_variance,
+            "variance_percentage": round(variance_percentage, 2),
+            "within_budget": amount_variance <= 0
+        }
+        
+        # Generate recommendations
+        recommendations = TwoWayVerifier._generate_recommendations(
+            procurement_status,
+            quantity_discrepancies,
+            rate_discrepancies,
+            missing_items,
+            excess_items,
+            financial_summary
+        )
+        
+        # Determine overall verification status
+        total_issues = len(quantity_discrepancies) + len(rate_discrepancies) + len(missing_items) + len(excess_items)
+        verification_status = "Approved" if total_issues == 0 else "Requires Review"
+        
+        return TwoWayVerificationResult(
+            verification_status=verification_status,
+            procurement_status=procurement_status,
+            po_number=po.po_number,
+            total_items_checked=len(po_items),
+            items_with_discrepancies=len(quantity_discrepancies) + len(rate_discrepancies),
+            quantity_discrepancies=quantity_discrepancies,
+            rate_discrepancies=rate_discrepancies,
+            missing_items=missing_items,
+            excess_items=excess_items,
+            financial_summary=financial_summary,
+            ai_summary="",  # Will be filled by AI
+            recommendations=recommendations
+        )
+    
+    @staticmethod
+    def _generate_recommendations(
+        procurement_status: ProcurementStatus,
+        quantity_discrepancies: List[ProcurementDiscrepancy],
+        rate_discrepancies: List[ProcurementDiscrepancy],
+        missing_items: List[str],
+        excess_items: List[str],
+        financial_summary: dict
+    ) -> List[str]:
+        """Generate actionable recommendations based on findings."""
+        recommendations = []
+        
+        if procurement_status == ProcurementStatus.EXACT_MATCH:
+            recommendations.append("✅ All quantities match. Proceed with payment approval.")
+        
+        if procurement_status == ProcurementStatus.EXCESS_PROCUREMENT:
+            recommendations.append("⚠️ Excess procurement detected. Verify authorization for additional items.")
+            recommendations.append("📋 Review excess items with procurement team before payment.")
+        
+        if procurement_status == ProcurementStatus.SHORT_PROCUREMENT:
+            recommendations.append("⚠️ Short delivery detected. Verify if partial delivery was authorized.")
+            recommendations.append("📞 Contact vendor regarding missing items.")
+            recommendations.append("💰 Adjust payment amount to reflect actual delivered quantity.")
+        
+        if procurement_status == ProcurementStatus.MIXED:
+            recommendations.append("🔍 Mixed procurement issues detected. Detailed review required.")
+            recommendations.append("📊 Reconcile each discrepancy with procurement and receiving teams.")
+        
+        if rate_discrepancies:
+            recommendations.append(f"💲 {len(rate_discrepancies)} rate mismatch(es) found. Verify with vendor before payment.")
+        
+        if not financial_summary.get("within_budget"):
+            variance = financial_summary.get("amount_variance", 0)
+            recommendations.append(f"⚠️ Invoice exceeds PO by ₹{abs(variance):,.2f}. Budget approval required.")
+        
+        if missing_items:
+            recommendations.append(f"📦 {len(missing_items)} item(s) from PO not invoiced. Follow up with vendor.")
+        
+        if excess_items:
+            recommendations.append(f"➕ {len(excess_items)} extra item(s) in invoice. Verify if these should be billed.")
+        
+        return recommendations if recommendations else ["✅ No issues found. Approve for payment."]
+
 # --- AI Summary Generator ---
 
 class AISummaryGenerator:
@@ -342,6 +617,24 @@ class AISummaryGenerator:
             logger.error(f"AI summary generation failed: {e}")
             return self._fallback_summary(po_number, discrepancies)
     
+    async def generate_two_way_summary(self, result: TwoWayVerificationResult) -> str:
+        """
+        Generate AI summary for 2-way verification.
+        
+        Args:
+            result: TwoWayVerificationResult object
+            
+        Returns:
+            AI-generated summary text
+        """
+        try:
+            prompt = self._build_two_way_prompt(result)
+            response = await self.model.generate_content_async(prompt)
+            return response.text.strip()
+        except Exception as e:
+            logger.error(f"AI summary generation failed: {e}")
+            return self._fallback_two_way_summary(result)
+    
     def _build_prompt(self, po_number: str, 
                      discrepancies: List[MatchDiscrepancy]) -> str:
         """Build the prompt for Gemini."""
@@ -366,6 +659,56 @@ class AISummaryGenerator:
             f"critical issues that require attention."
         )
     
+    def _build_two_way_prompt(self, result: TwoWayVerificationResult) -> str:
+        """Build prompt for 2-way verification summary."""
+        issues = []
+        
+        if result.quantity_discrepancies:
+            for disc in result.quantity_discrepancies:
+                status = "excess" if disc.variance > 0 else "short"
+                issues.append(
+                    f"- {disc.item_description}: {status} by {abs(disc.variance)} units "
+                    f"({abs(disc.variance_percentage):.1f}%)"
+                )
+        
+        if result.rate_discrepancies:
+            for disc in result.rate_discrepancies:
+                issues.append(
+                    f"- {disc.item_description}: rate difference of ₹{abs(disc.amount_variance):.2f}"
+                )
+        
+        if result.missing_items:
+            issues.append(f"- Missing items from invoice: {', '.join(result.missing_items[:3])}")
+        
+        if result.excess_items:
+            issues.append(f"- Extra items in invoice: {', '.join(result.excess_items[:3])}")
+        
+        variance_info = (
+            f"Invoice amount is ₹{abs(result.financial_summary['amount_variance']):,.2f} "
+            f"{'higher' if result.financial_summary['amount_variance'] > 0 else 'lower'} than PO "
+            f"({abs(result.financial_summary['variance_percentage']):.1f}% variance)."
+        )
+        
+        if issues:
+            issues_text = "\n".join(issues)
+            prompt = (
+                f"A 2-way verification (PO vs Invoice) for Purchase Order {result.po_number} "
+                f"found the following:\n\n"
+                f"Procurement Status: {result.procurement_status.value}\n"
+                f"{variance_info}\n\n"
+                f"Issues:\n{issues_text}\n\n"
+                f"Generate a concise, professional 2-3 sentence summary highlighting the "
+                f"procurement status and key financial implications. Focus on actionable insights."
+            )
+        else:
+            prompt = (
+                f"A 2-way verification (PO vs Invoice) for Purchase Order {result.po_number} "
+                f"shows perfect alignment. All items, quantities, and rates match exactly. "
+                f"Generate a brief 1-sentence confirmation suitable for approval."
+            )
+        
+        return prompt
+    
     def _fallback_summary(self, po_number: str, 
                          discrepancies: List[MatchDiscrepancy]) -> str:
         """Generate a basic summary if AI fails."""
@@ -377,13 +720,24 @@ class AISummaryGenerator:
             f"discrepancy(ies) requiring attention. Please review the detailed "
             f"discrepancy list for resolution."
         )
+    
+    def _fallback_two_way_summary(self, result: TwoWayVerificationResult) -> str:
+        """Generate basic summary for 2-way verification if AI fails."""
+        if result.verification_status == "Approved":
+            return f"2-way verification for PO {result.po_number} approved. All items and amounts match."
+        
+        return (
+            f"2-way verification for PO {result.po_number} requires review. "
+            f"Procurement status: {result.procurement_status.value}. "
+            f"{result.items_with_discrepancies} item(s) have discrepancies."
+        )
 
 # --- API Endpoints ---
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "service": "3-Way Match API"}
+    return {"status": "healthy", "service": "Procurement Verification API"}
 
 @app.post("/process-documents/", response_model=MatchResult)
 async def process_documents(texts: DocumentTexts):
@@ -449,6 +803,139 @@ async def process_documents(texts: DocumentTexts):
             detail=f"An unexpected error occurred: {str(e)}"
         )
 
+# --- NEW ENDPOINT: 2-Way Verification with PDF Upload ---
+
+@app.post("/verify-procurement/", response_model=TwoWayVerificationResult)
+async def verify_procurement(
+    po_pdf: UploadFile = File(..., description="Purchase Order PDF file"),
+    invoice_pdf: UploadFile = File(..., description="Purchase Invoice PDF file")
+):
+    """
+    Perform 2-way verification between PO and Invoice PDFs.
+    
+    Identifies:
+    - Excess procurement (invoice quantity > PO quantity)
+    - Short procurement (invoice quantity < PO quantity)
+    - Rate mismatches
+    - Missing or extra items
+    
+    Args:
+        po_pdf: Purchase Order PDF file
+        invoice_pdf: Purchase Invoice PDF file
+        
+    Returns:
+        TwoWayVerificationResult with detailed procurement analysis
+    """
+    logger.info("Starting 2-way procurement verification")
+    
+    try:
+        # Validate file types
+        if not po_pdf.filename.lower().endswith('.pdf'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Purchase Order must be a PDF file"
+            )
+        
+        if not invoice_pdf.filename.lower().endswith('.pdf'):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Purchase Invoice must be a PDF file"
+            )
+        
+        # Extract text from PDFs
+        logger.info(f"Extracting text from PO: {po_pdf.filename}")
+        po_text = await PDFParser.extract_text_from_pdf(po_pdf)
+        
+        logger.info(f"Extracting text from Invoice: {invoice_pdf.filename}")
+        invoice_text = await PDFParser.extract_text_from_pdf(invoice_pdf)
+        
+        # Parse documents
+        parsed_po = DocumentParser.parse(po_text, "Purchase Order")
+        parsed_invoice = DocumentParser.parse(invoice_text, "Purchase Invoice")
+        
+        logger.info(f"Successfully parsed both documents for PO {parsed_po.po_number}")
+        
+        # Perform 2-way verification
+        verifier = TwoWayVerifier()
+        result = verifier.verify(parsed_po, parsed_invoice)
+        
+        # Generate AI summary
+        summary_generator = AISummaryGenerator()
+        ai_summary = await summary_generator.generate_two_way_summary(result)
+        
+        # Update result with AI summary
+        result.ai_summary = ai_summary
+        
+        logger.info(
+            f"Verification completed: {result.verification_status}, "
+            f"Procurement Status: {result.procurement_status.value}"
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during procurement verification: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
+
+# --- ADDITIONAL ENDPOINT: 2-Way Verification with Text Input ---
+
+@app.post("/verify-procurement-text/", response_model=TwoWayVerificationResult)
+async def verify_procurement_text(request: ProcurementTextRequest):
+    """
+    Perform 2-way verification between PO and Invoice using text input.
+
+    Args:
+        request: JSON payload containing raw text from Purchase Order & Invoice
+
+    Returns:
+        TwoWayVerificationResult with detailed procurement analysis
+    """
+    logger.info("Starting 2-way procurement verification (text input via JSON)")
+
+    try:
+        # Parse documents
+        print("Parsing documents from text input")
+        parsed_po = DocumentParser.parse(request.purchase_order_text, "Purchase Order")
+        print("Parsed PO successfully")
+        parsed_invoice = DocumentParser.parse(request.purchase_invoice_text, "Purchase Invoice")
+        print("Parsed Invoice successfully")
+
+        logger.info(f"Successfully parsed both documents for PO {parsed_po.po_number}")
+
+        # Perform 2-way verification
+        print("Performing 2-way verification")
+        verifier = TwoWayVerifier()
+        print("Verifier initialized")
+        result = verifier.verify(parsed_po, parsed_invoice)
+        print("Verification completed")
+
+        # Generate AI summary
+        summary_generator = AISummaryGenerator()
+        ai_summary = await summary_generator.generate_two_way_summary(result)
+
+        # Update result with AI summary
+        result.ai_summary = ai_summary
+
+        logger.info(
+            f"Verification completed: {result.verification_status}, "
+            f"Procurement Status: {result.procurement_status.value}"
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during procurement verification: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
