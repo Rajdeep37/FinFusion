@@ -203,4 +203,4 @@ Passionate about **AI Automation**, **Data Engineering**, and **Intelligent Syst
 
 ## 💻 Notion Link
 
-https://flossy-dollar-160.notion.site/FinFusion-28211efbcd9e80dfa409cf1bc2a6eac2
+https://flossy-dollar-160.notion.site/FinFusion-28211efbcd9e80dfa409cf1bc2a6eac2?pvs=73
