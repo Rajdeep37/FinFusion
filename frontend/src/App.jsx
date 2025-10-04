@@ -1,6 +1,6 @@
 import { useState } from "react";
 import * as pdfjsLib from "pdfjs-dist";
-import pdfjsWorker from "pdfjs-dist/build/pdf.worker?url"; 
+import pdfjsWorker from "pdfjs-dist/build/pdf.worker?url";
 import "./App.css";
 
 // Configure pdf.js worker
@@ -12,6 +12,7 @@ function App() {
   const [invoiceText, setInvoiceText] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [mode, setMode] = useState(""); // "2-way" or "3-way"
 
   // Extract text from uploaded PDF
   const extractTextFromPDF = async (file) => {
@@ -48,23 +49,16 @@ function App() {
     if (type === "invoice") setInvoiceText(text);
   };
 
-  // Send extracted text to backend
-  const sendToBackend = async () => {
-    if (!poText || !grnText || !invoiceText) {
-      alert("Please upload all three documents first!");
-      return;
-    }
-
+  // Send to backend
+  const sendToBackend = async (endpoint, payload, verificationType) => {
     setLoading(true);
+    setResult(null);
+    setMode(verificationType);
     try {
-      const response = await fetch("http://localhost:8000/process-documents/", {
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          purchase_order_text: poText,
-          goods_receipt_note_text: grnText,
-          purchase_invoice_text: invoiceText,
-        }),
+        body: JSON.stringify(payload),
       });
 
       if (!response.ok) throw new Error("Backend error");
@@ -78,9 +72,40 @@ function App() {
     }
   };
 
+  // 3-Way Verification
+  const handleThreeWayVerification = async () => {
+    if (!poText || !grnText || !invoiceText) {
+      alert("Please upload PO, GRN, and Invoice for 3-way verification!");
+      return;
+    }
+
+    const payload = {
+      purchase_order_text: poText,
+      goods_receipt_note_text: grnText,
+      purchase_invoice_text: invoiceText,
+    };
+
+    await sendToBackend("http://localhost:8000/process-documents/", payload, "3-way");
+  };
+
+  // 2-Way Verification
+  const handleTwoWayVerification = async () => {
+    if (!poText || !invoiceText) {
+      alert("Please upload PO and Invoice for 2-way verification!");
+      return;
+    }
+
+    const payload = {
+      purchase_order_text: poText,
+      purchase_invoice_text: invoiceText,
+    };
+
+    await sendToBackend("http://localhost:8000/verify-procurement-text/", payload, "2-way");
+  };
+
   return (
     <div className="App">
-      <h1>3-Way Match Verifier</h1>
+      <h1>Procurement Verification Portal</h1>
 
       <div className="upload-section">
         <label>Upload Purchase Order (PO): </label>
@@ -97,32 +122,109 @@ function App() {
         <input type="file" accept="application/pdf" onChange={(e) => handleFileUpload(e, "invoice")} />
       </div>
 
-      <button onClick={sendToBackend} disabled={loading}>
-        {loading ? "Processing..." : "Send to Backend"}
-      </button>
+      <div className="button-group">
+        <button onClick={handleTwoWayVerification} disabled={loading}>
+          {loading && mode === "2-way" ? "Processing..." : "2-Way Verification"}
+        </button>
+        <button onClick={handleThreeWayVerification} disabled={loading}>
+          {loading && mode === "3-way" ? "Processing..." : "3-Way Verification"}
+        </button>
+      </div>
 
+      {/* === RESULT DISPLAY === */}
       {result && (
         <div className="result-container">
-          <h2>Result</h2>
-          <p><b>Status:</b> {result.match_status}</p>
-          <p><b>PO Number:</b> {result.po_number}</p>
-          <p><b>AI Summary:</b> {result.ai_summary}</p>
+          <h2>Verification Result</h2>
 
-          <h3>Discrepancies</h3>
-          {result.discrepancies.length === 0 ? (
-            <p>No discrepancies found ✅</p>
-          ) : (
-            <ul>
-              {result.discrepancies.map((d, idx) => (
-                <li key={idx}>
-                  <b>{d.discrepancy_type}</b>: {d.item_description} - {d.issue}
-                </li>
-              ))}
-            </ul>
+          {/* === 3-WAY RESULT === */}
+          {mode === "3-way" && (
+            <>
+              <p><b>Status:</b> {result.match_status}</p>
+              <p><b>PO Number:</b> {result.po_number}</p>
+              <p><b>AI Summary:</b> {result.ai_summary}</p>
+
+              <h3>Discrepancies</h3>
+              {result.discrepancies?.length === 0 ? (
+                <p>No discrepancies found ✅</p>
+              ) : (
+                <ul>
+                  {result.discrepancies.map((d, idx) => (
+                    <li key={idx}>
+                      <b>{d.discrepancy_type}</b>: {d.item_description} - {d.issue}
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <h3>Statistics</h3>
+              <pre>{JSON.stringify(result.statistics, null, 2)}</pre>
+            </>
           )}
 
-          <h3>Statistics</h3>
-          <pre>{JSON.stringify(result.statistics, null, 2)}</pre>
+          {/* === 2-WAY RESULT === */}
+          {mode === "2-way" && (
+            <>
+              <p><b>Verification Status:</b> {result.verification_status}</p>
+              <p><b>Procurement Status:</b> {result.procurement_status}</p>
+              <p><b>PO Number:</b> {result.po_number}</p>
+              <p><b>AI Summary:</b> {result.ai_summary}</p>
+
+              <h3>Items Checked</h3>
+              <p><b>Total Items Checked:</b> {result.total_items_checked}</p>
+              <p><b>Items with Discrepancies:</b> {result.items_with_discrepancies}</p>
+
+              {result.quantity_discrepancies?.length > 0 && (
+                <>
+                  <h3>Quantity Discrepancies</h3>
+                  <ul>
+                    {result.quantity_discrepancies.map((item, idx) => (
+                      <li key={idx}>
+                        <b>{item.item_description}</b> (Code: {item.stock_code})<br />
+                        PO Qty: {item.po_quantity}, Invoice Qty: {item.invoice_quantity}<br />
+                        Variance: {item.variance} ({item.variance_percentage}%)
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+
+              {result.excess_items?.length > 0 && (
+                <>
+                  <h3>Excess Items</h3>
+                  <ul>
+                    {result.excess_items.map((item, idx) => (
+                      <li key={idx}>{item}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+
+              {result.missing_items?.length > 0 && (
+                <>
+                  <h3>Missing Items</h3>
+                  <ul>
+                    {result.missing_items.map((item, idx) => (
+                      <li key={idx}>{item}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+
+              <h3>Financial Summary</h3>
+              <pre>{JSON.stringify(result.financial_summary, null, 2)}</pre>
+
+              {result.recommendations?.length > 0 && (
+                <>
+                  <h3>AI Recommendations</h3>
+                  <ul>
+                    {result.recommendations.map((rec, idx) => (
+                      <li key={idx}>{rec}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </>
+          )}
         </div>
       )}
     </div>

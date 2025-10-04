@@ -1,0 +1,22 @@
+# --- Core Backend Framework ---
+fastapi==0.115.2
+uvicorn==0.30.1
+
+# --- PDF Processing (for server-side extraction, if needed) ---
+PyMuPDF==1.24.4
+pdfplumber==0.11.1
+
+# --- AI / LLM Integration ---
+google-generativeai==0.7.2
+
+# --- Data Handling ---
+pandas==2.2.2
+numpy==1.26.4
+
+# --- Utility & Environment Management ---
+python-dotenv==1.0.1
+pydantic==2.8.2
+requests==2.32.3
+
+# --- Optional (for debugging / dev use) ---
+httpx==0.27.0
