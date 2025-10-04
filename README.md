@@ -198,3 +198,9 @@ Passionate about **AI Automation**, **Data Engineering**, and **Intelligent Syst
 **👨‍💻 Nehil Chandrakar**
 B.E. in **Artificial Intelligence & Machine Learning**
 Passionate about **AI Automation**, **Data Engineering**, and **Intelligent Systems**
+
+---
+
+## 💻 Notion Link
+
+https://flossy-dollar-160.notion.site/FinFusion-28211efbcd9e80dfa409cf1bc2a6eac2
